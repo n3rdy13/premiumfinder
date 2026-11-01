@@ -216,6 +216,15 @@ static PFHook g_hooks[PF_MAX_HOOKS];
 static int g_hookCount = 0;
 static pthread_mutex_t g_hookLock = PTHREAD_MUTEX_INITIALIZER;
 
+// SDK-portable return-type lookup: current SDK fills a caller buffer,
+// older SDKs returned a pointer (removed in newer SDKs).
+static char pf_return_type_char(Method m) {
+    char buf[64];
+    buf[0] = 0;
+    method_getReturnType(m, buf, sizeof(buf));
+    return buf[0];
+}
+
 static BOOL PFHooked(Class cls, SEL sel) {
     const char *n = sel_getName(sel);
     pthread_mutex_lock(&g_hookLock);
@@ -243,9 +252,7 @@ static IMP PFOrigFor(id self, SEL sel) {
 static void PFInstall(Class cls, SEL sel, IMP hook) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
-    size_t sz = 0;
-    const char *rt = method_getReturnType(m, &sz);
-    char rc = rt ? rt[0] : 0;
+    char rc = pf_return_type_char(m);
     const char *enc = method_getTypeEncoding(m);
     IMP orig = method_getImplementation(m);
 
@@ -560,9 +567,7 @@ static void pf_scan(void) {
             if (!(cm || PFMatches(sn))) continue;
 
             unsigned nargs = method_getNumberOfArguments(ms[j]);
-            size_t sz = 0;
-            const char *rt = method_getReturnType(ms[j], &sz);
-            char rc = rt ? rt[0] : 0;
+            char rc = pf_return_type_char(ms[j]);
 
             NSString *key = [NSString stringWithFormat:@"%s %s", cn, sn];
             if (![g_seenMethods containsObject:key]) {
