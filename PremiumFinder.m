@@ -3,21 +3,26 @@
 //  Runtime inspector for premium / IAP feature gates in an injected iOS app.
 //  Pure ObjC runtime swizzling. No CydiaSubstrate, no Logos.
 //
+//  SAFETY MODEL:
+//    - Constructor does almost nothing (no swizzling/scan at dyld time).
+//    - The inspector is ARMED after the app has a key window (default), which
+//      avoids touching the runtime during startup. Opt into load-time arming
+//      with PF_EARLY=1 if you need to catch startup-time checks.
+//    - The class scan/hook is restricted to the APP'S OWN CODE (main binary +
+//      embedded frameworks) by default, so system/framework methods are never
+//      swizzled. Opt into system classes with PF_SYSTEM=1.
+//    - All NSUserDefaults taps guard that the key is an NSString.
+//    - Kill switch: PF_DISABLE=1 / PremiumFinder.disable disables everything.
+//
 //  On launch it pops a keyword-entry box (deferred until a window exists).
 //  Generic keywords in kKeywords[] are ALWAYS active.
-//  Extras come from: the popup box, env PF_KEYWORDS, NSUserDefaults "PFKeywords",
-//  and keyword files (see pf_keyword_config_paths). All are additive.
 //
-//  Toggles:
-//    env PF_NO_AUTOPROMPT=1 | defaults PFNoAutoPrompt=YES | file PremiumFinder.noautoprompt
-//    env PF_NO_BUTTON=1     | defaults PFNoButton=YES     | file PremiumFinder.nobutton
-//
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <StoreKit/StoreKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
 #import <pthread.h>
 #import <string.h>
 #import <stdlib.h>
@@ -216,8 +221,7 @@ static PFHook g_hooks[PF_MAX_HOOKS];
 static int g_hookCount = 0;
 static pthread_mutex_t g_hookLock = PTHREAD_MUTEX_INITIALIZER;
 
-// SDK-portable return-type lookup: current SDK fills a caller buffer,
-// older SDKs returned a pointer (removed in newer SDKs).
+// SDK-portable return-type lookup.
 static char pf_return_type_char(Method m) {
     char buf[64];
     buf[0] = 0;
@@ -252,8 +256,9 @@ static IMP PFOrigFor(id self, SEL sel) {
 static void PFInstall(Class cls, SEL sel, IMP hook) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
-    char rc = pf_return_type_char(m);
     const char *enc = method_getTypeEncoding(m);
+    if (!enc || !enc[0]) return;              // no reliable encoding -> don't hook
+    char rc = pf_return_type_char(m);
     IMP orig = method_getImplementation(m);
 
     if (class_addMethod(cls, sel, hook, enc)) {
@@ -279,6 +284,7 @@ static void PFInstall(Class cls, SEL sel, IMP hook) {
 static void pf_imp_void(id self, SEL _cmd) {
     IMP o = PFOrigFor(self, _cmd);
     if (o) ((void(*)(id, SEL))o)(self, _cmd);
+    else PFLog(@"!! missing original for -[%s]; call skipped", sel_getName(_cmd));
     if (PFShouldLog(_cmd))
         PFLog(@"%@ -[%s] called", NSStringFromClass(object_getClass(self)), sel_getName(_cmd));
 }
@@ -332,78 +338,97 @@ static IMP pf_hook_for_type(char rt) {
     }
 }
 
-#pragma mark - NSUserDefaults hooks
+#pragma mark - NSUserDefaults hooks (key-guarded)
 
-static id pf_ud_objectForKey(id self, SEL _cmd, NSString *key) {
+static inline NSString *pf_str(id o) {
+    return [o isKindOfClass:[NSString class]] ? (NSString *)o : nil;
+}
+
+static id pf_ud_objectForKey(id self, SEL _cmd, id key) {
     IMP o = PFOrigFor(self, _cmd);
     id r = o ? ((id(*)(id, SEL, id))o)(self, _cmd, key) : nil;
-    if (PFMatches(key.UTF8String)) PFLog(@"defaults[%@] object = %@", key, r);
+    NSString *k = pf_str(key);
+    if (k && PFMatches(k.UTF8String)) { @try { PFLog(@"defaults[%@] object = %@", k, r); } @catch (id e) {} }
     return r;
 }
-static BOOL pf_ud_boolForKey(id self, SEL _cmd, NSString *key) {
+static BOOL pf_ud_boolForKey(id self, SEL _cmd, id key) {
     IMP o = PFOrigFor(self, _cmd);
     BOOL r = o ? ((BOOL(*)(id, SEL, id))o)(self, _cmd, key) : NO;
-    if (PFMatches(key.UTF8String)) PFLog(@"defaults[%@] bool = %@", key, r ? @"YES" : @"NO");
+    NSString *k = pf_str(key);
+    if (k && PFMatches(k.UTF8String)) PFLog(@"defaults[%@] bool = %@", k, r ? @"YES" : @"NO");
     return r;
 }
-static long long pf_ud_integerForKey(id self, SEL _cmd, NSString *key) {
+static long long pf_ud_integerForKey(id self, SEL _cmd, id key) {
     IMP o = PFOrigFor(self, _cmd);
     long long r = o ? ((long long(*)(id, SEL, id))o)(self, _cmd, key) : 0;
-    if (PFMatches(key.UTF8String)) PFLog(@"defaults[%@] integer = %lld", key, r);
+    NSString *k = pf_str(key);
+    if (k && PFMatches(k.UTF8String)) PFLog(@"defaults[%@] integer = %lld", k, r);
     return r;
 }
-static float pf_ud_floatForKey(id self, SEL _cmd, NSString *key) {
+static float pf_ud_floatForKey(id self, SEL _cmd, id key) {
     IMP o = PFOrigFor(self, _cmd);
     float r = o ? ((float(*)(id, SEL, id))o)(self, _cmd, key) : 0;
-    if (PFMatches(key.UTF8String)) PFLog(@"defaults[%@] float = %f", key, r);
+    NSString *k = pf_str(key);
+    if (k && PFMatches(k.UTF8String)) PFLog(@"defaults[%@] float = %f", k, r);
     return r;
 }
-static double pf_ud_doubleForKey(id self, SEL _cmd, NSString *key) {
+static double pf_ud_doubleForKey(id self, SEL _cmd, id key) {
     IMP o = PFOrigFor(self, _cmd);
     double r = o ? ((double(*)(id, SEL, id))o)(self, _cmd, key) : 0;
-    if (PFMatches(key.UTF8String)) PFLog(@"defaults[%@] double = %f", key, r);
+    NSString *k = pf_str(key);
+    if (k && PFMatches(k.UTF8String)) PFLog(@"defaults[%@] double = %f", k, r);
     return r;
 }
-static id pf_ud_stringForKey(id self, SEL _cmd, NSString *key) {
+static id pf_ud_stringForKey(id self, SEL _cmd, id key) {
     IMP o = PFOrigFor(self, _cmd);
     id r = o ? ((id(*)(id, SEL, id))o)(self, _cmd, key) : nil;
-    if (PFMatches(key.UTF8String)) PFLog(@"defaults[%@] string = %@", key, r);
+    NSString *k = pf_str(key);
+    if (k && PFMatches(k.UTF8String)) PFLog(@"defaults[%@] string = %@", k, r);
     return r;
 }
-static id pf_ud_arrayForKey(id self, SEL _cmd, NSString *key)      { IMP o = PFOrigFor(self,_cmd); id r = o?((id(*)(id,SEL,id))o)(self,_cmd,key):nil; if (PFMatches(key.UTF8String)) PFLog(@"defaults[%@] array = %@", key, r); return r; }
-static id pf_ud_dictionaryForKey(id self, SEL _cmd, NSString *key) { IMP o = PFOrigFor(self,_cmd); id r = o?((id(*)(id,SEL,id))o)(self,_cmd,key):nil; if (PFMatches(key.UTF8String)) PFLog(@"defaults[%@] dict = %@", key, r); return r; }
-static id pf_ud_dataForKey(id self, SEL _cmd, NSString *key)       { IMP o = PFOrigFor(self,_cmd); id r = o?((id(*)(id,SEL,id))o)(self,_cmd,key):nil; if (PFMatches(key.UTF8String)) PFLog(@"defaults[%@] data = %@", key, r); return r; }
+static id pf_ud_arrayForKey(id self, SEL _cmd, id key)      { IMP o=PFOrigFor(self,_cmd); id r=o?((id(*)(id,SEL,id))o)(self,_cmd,key):nil; NSString *k=pf_str(key); if(k&&PFMatches(k.UTF8String)) PFLog(@"defaults[%@] array = %@",k,r); return r; }
+static id pf_ud_dictionaryForKey(id self, SEL _cmd, id key) { IMP o=PFOrigFor(self,_cmd); id r=o?((id(*)(id,SEL,id))o)(self,_cmd,key):nil; NSString *k=pf_str(key); if(k&&PFMatches(k.UTF8String)) PFLog(@"defaults[%@] dict = %@",k,r); return r; }
+static id pf_ud_dataForKey(id self, SEL _cmd, id key)       { IMP o=PFOrigFor(self,_cmd); id r=o?((id(*)(id,SEL,id))o)(self,_cmd,key):nil; NSString *k=pf_str(key); if(k&&PFMatches(k.UTF8String)) PFLog(@"defaults[%@] data = %@",k,r); return r; }
 
-static void pf_ud_setBool(id self, SEL _cmd, BOOL v, NSString *key) {
+static void pf_ud_setBool(id self, SEL _cmd, BOOL v, id key) {
     IMP o = PFOrigFor(self, _cmd);
-    if (PFMatches(key.UTF8String)) PFLog(@"defaults SET [%@] bool = %@", key, v ? @"YES" : @"NO");
+    NSString *k = pf_str(key);
+    if (k && PFMatches(k.UTF8String)) PFLog(@"defaults SET [%@] bool = %@", k, v ? @"YES" : @"NO");
     if (o) ((void(*)(id, SEL, BOOL, id))o)(self, _cmd, v, key);
 }
-static void pf_ud_setInteger(id self, SEL _cmd, long long v, NSString *key) {
+static void pf_ud_setInteger(id self, SEL _cmd, long long v, id key) {
     IMP o = PFOrigFor(self, _cmd);
-    if (PFMatches(key.UTF8String)) PFLog(@"defaults SET [%@] integer = %lld", key, v);
+    NSString *k = pf_str(key);
+    if (k && PFMatches(k.UTF8String)) PFLog(@"defaults SET [%@] integer = %lld", k, v);
     if (o) ((void(*)(id, SEL, long long, id))o)(self, _cmd, v, key);
 }
-static void pf_ud_setFloat(id self, SEL _cmd, float v, NSString *key) {
+static void pf_ud_setFloat(id self, SEL _cmd, float v, id key) {
     IMP o = PFOrigFor(self, _cmd);
-    if (PFMatches(key.UTF8String)) PFLog(@"defaults SET [%@] float = %f", key, v);
+    NSString *k = pf_str(key);
+    if (k && PFMatches(k.UTF8String)) PFLog(@"defaults SET [%@] float = %f", k, v);
     if (o) ((void(*)(id, SEL, float, id))o)(self, _cmd, v, key);
 }
-static void pf_ud_setObject(id self, SEL _cmd, id v, NSString *key) {
+static void pf_ud_setObject(id self, SEL _cmd, id v, id key) {
     IMP o = PFOrigFor(self, _cmd);
-    if (PFMatches(key.UTF8String)) PFLog(@"defaults SET [%@] obj = %@", key, v);
+    NSString *k = pf_str(key);
+    if (k && PFMatches(k.UTF8String)) { @try { PFLog(@"defaults SET [%@] obj = %@", k, v); } @catch (id e) {} }
     if (o) ((void(*)(id, SEL, id, id))o)(self, _cmd, v, key);
 }
 static void pf_ud_registerDefaults(id self, SEL _cmd, NSDictionary *reg) {
     IMP o = PFOrigFor(self, _cmd);
-    for (NSString *k in reg) if (PFMatches(k.UTF8String)) PFLog(@"registerDefaults[%@] = %@", k, reg[k]);
+    if ([reg isKindOfClass:[NSDictionary class]])
+        for (id kk in reg) { NSString *k = pf_str(kk);
+            if (k && PFMatches(k.UTF8String)) { @try { PFLog(@"registerDefaults[%@] = %@", k, reg[kk]); } @catch (id e) {} } }
     if (o) ((void(*)(id, SEL, id))o)(self, _cmd, reg);
 }
 static id pf_ud_dictRep(id self, SEL _cmd) {
     IMP o = PFOrigFor(self, _cmd);
     id r = o ? ((id(*)(id, SEL))o)(self, _cmd) : nil;
-    if (PFShouldLog(_cmd) && [r isKindOfClass:[NSDictionary class]])
-        for (NSString *k in r) if (PFMatches(k.UTF8String)) PFLog(@"defaults snapshot [%@] = %@", k, r[k]);
+    if (PFShouldLog(_cmd) && [r isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)r;
+        for (id kk in d) { NSString *k = pf_str(kk);
+            if (k && PFMatches(k.UTF8String)) { @try { PFLog(@"defaults snapshot [%@] = %@", k, d[kk]); } @catch (id e) {} } }
+    }
     return r;
 }
 
@@ -415,10 +440,11 @@ static id pf_bundle_receiptURL(id self, SEL _cmd) {
     PFLog(@"NSBundle appStoreReceiptURL -> %@", r);
     return r;
 }
-static BOOL pf_fm_fileExists(id self, SEL _cmd, NSString *path) {
+static BOOL pf_fm_fileExists(id self, SEL _cmd, id path) {
     IMP o = PFOrigFor(self, _cmd);
     BOOL r = o ? ((BOOL(*)(id, SEL, id))o)(self, _cmd, path) : NO;
-    if ([path.lowercaseString containsString:@"receipt"]) PFLog(@"fileExistsAtPath:%@ -> %@", path, r ? @"YES" : @"NO");
+    NSString *s = pf_str(path);
+    if (s && [s.lowercaseString containsString:@"receipt"]) PFLog(@"fileExistsAtPath:%@ -> %@", s, r ? @"YES" : @"NO");
     return r;
 }
 static void pf_sk_addPayment(id self, SEL _cmd, id payment) {
@@ -524,7 +550,7 @@ static void pf_install_platform(void) {
     if (st) PFInstall(st, sel_registerName("transactionState"), (IMP)pf_txn_state);
 }
 
-#pragma mark - Class scan
+#pragma mark - Class scan (app-owned classes by default)
 
 static NSMutableSet *g_loggedClasses = nil;
 static NSMutableSet *g_seenMethods   = nil;
@@ -535,9 +561,34 @@ static const char *kNever[] = {
     "debugDescription", "superclass", "delegate"
 };
 
+// Is this class defined inside the app bundle (main binary or embedded framework)?
+static BOOL pf_class_in_app(Class cls) {
+    const char *img = class_getImageName(cls);
+    if (!img) return NO;
+    static NSString *marker = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *bundlePath = [[NSBundle mainBundle] bundlePath];   // .../App.app
+        NSString *name = bundlePath.lastPathComponent;               // App.app
+        if (name.length) marker = [NSString stringWithFormat:@"/%@/", name];
+    });
+    if (!marker) return NO;
+    NSString *p = [NSString stringWithUTF8String:img];
+    return p && [p containsString:marker];
+}
+
+static BOOL pf_system_classes_enabled(void) {
+    const char *e = getenv("PF_SYSTEM");
+    if (e && e[0] && e[0] != '0') return YES;
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"PFSystemClasses"]) return YES;
+    return NO;
+}
+
 static void pf_scan(void) {
     if (!g_loggedClasses) g_loggedClasses = [NSMutableSet set];
     if (!g_seenMethods)   g_seenMethods   = [NSMutableSet set];
+
+    BOOL includeSystem = pf_system_classes_enabled();
 
     int count = objc_getClassList(NULL, 0);
     if (count <= 0) return;
@@ -547,6 +598,10 @@ static void pf_scan(void) {
     int nClasses = 0, nMethods = 0, nHooked = 0;
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
+
+        // Restrict to the app's own code unless explicitly widened.
+        if (!includeSystem && !pf_class_in_app(cls)) continue;
+
         const char *cn = class_getName(cls);
         BOOL cm = PFMatches(cn);
         NSString *clsName = [NSString stringWithUTF8String:cn];
@@ -554,7 +609,8 @@ static void pf_scan(void) {
         if (cm) {
             if (![g_loggedClasses containsObject:clsName]) {
                 [g_loggedClasses addObject:clsName];
-                PFLog(@"class: %s (super=%s)", cn, class_getName(class_getSuperclass(cls)));
+                Class sup = class_getSuperclass(cls);
+                PFLog(@"class: %s (super=%s)", cn, sup ? class_getName(sup) : "(none)");
             }
             nClasses++;
         }
@@ -610,7 +666,8 @@ static void pf_scan(void) {
         free(ps);
     }
     free(classes);
-    PFLog(@"scan complete: classes=%d methods=%d hooked=%d", nClasses, nMethods, nHooked);
+    PFLog(@"scan complete: classes=%d methods=%d hooked=%d (scope=%@)",
+          nClasses, nMethods, nHooked, includeSystem ? @"system+app" : @"app");
 }
 
 #pragma mark - Log path setup
@@ -648,6 +705,16 @@ static BOOL pf_flag_file_present(NSString *name) {
     return NO;
 }
 
+static BOOL pf_flag(NSString *env, NSString *defaultsKey, NSString *fileName) {
+    const char *e = getenv(env.UTF8String);
+    if (e && e[0] && e[0] != '0') return YES;
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:defaultsKey]) return YES;
+    if (pf_flag_file_present(fileName)) return YES;
+    return NO;
+}
+
+static BOOL pf_disabled(void)        { return pf_flag(@"PF_DISABLE",  @"PFDisabled",      @"PremiumFinder.disable"); }
+static BOOL pf_early_enabled(void)   { return pf_flag(@"PF_EARLY",    @"PFEarly",         @"PremiumFinder.early"); }
 static BOOL pf_autoprompt_enabled(void) {
     const char *e = getenv("PF_NO_AUTOPROMPT");
     if (e && e[0] && e[0] != '0') return NO;
@@ -702,15 +769,13 @@ static void pf_show_float_button(void);
     pf_dismiss_prompt();
     pf_reload_keywords();
     PFLog(@"=== rescan after keyword entry ===");
-    pf_scan();
+    @try { pf_scan(); } @catch (id e) { PFLog(@"scan exception: %@", e); }
 }
 - (void)onSkip {
     PFLog(@"keyword prompt: skipped");
     pf_dismiss_prompt();
 }
-- (void)onOpen:(id)sender {
-    pf_show_keyword_prompt();
-}
+- (void)onOpen:(id)sender { pf_show_keyword_prompt(); }
 - (void)onPan:(UIPanGestureRecognizer *)g {
     UIButton *b = (UIButton *)g.view;
     UIView *sup = b.superview;
@@ -914,6 +979,23 @@ static void pf_show_float_button(void) {
     PFLog(@"floating PF button shown (tap to edit keywords)");
 }
 
+#pragma mark - Arm (install + scan), deferred
+
+static BOOL g_armed = NO;
+
+static void pf_arm(const char *why) {
+    if (g_armed) return;
+    g_armed = YES;
+    PFLog(@"arming (%s)", why);
+    @try { pf_install_platform(); } @catch (id e) { PFLog(@"platform install exception: %@", e); }
+    @try { pf_scan(); } @catch (id e) { PFLog(@"scan exception: %@", e); }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        PFLog(@"=== rescan (late-loaded classes) ===");
+        @try { pf_scan(); } @catch (id e) { PFLog(@"rescan exception: %@", e); }
+    });
+}
+
 #pragma mark - Watchers
 
 static void pf_watch_keywords(void) {
@@ -929,8 +1011,10 @@ static void pf_watch_keywords(void) {
             last = sig;
             PFLog(@"keyword config changed -> reloading + rescan");
             pf_reload_keywords();
-            PFLog(@"=== rescan after keyword reload ===");
-            pf_scan();
+            if (g_armed) {
+                PFLog(@"=== rescan after keyword reload ===");
+                @try { pf_scan(); } @catch (id e) { PFLog(@"scan exception: %@", e); }
+            }
         }
     });
     dispatch_resume(timer);
@@ -965,6 +1049,7 @@ static void pf_await_window(int attempt) {
         UIWindow *w = pf_key_window();
         if (w) {
             PFLog(@"window ready");
+            if (!g_armed) pf_arm("window ready");   // SAFE default: arm after launch
             if (pf_autoprompt_enabled()) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{ pf_show_keyword_prompt(); });
@@ -976,7 +1061,7 @@ static void pf_await_window(int attempt) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ pf_await_window(attempt + 1); });
         } else {
-            PFLog(@"no key window found; keyword prompt unavailable");
+            PFLog(@"no key window found; inspector not armed");
         }
     });
 }
@@ -992,20 +1077,20 @@ static void pf_init(void) {
         PFLog(@"=== PremiumFinder loaded pid=%d bundle=%@ ===",
               getpid(), [[NSBundle mainBundle] bundleIdentifier]);
 
-        // Generic coverage is live immediately so nothing is missed while the box is up.
-        pf_install_platform();
-        pf_scan();
+        if (pf_disabled()) {
+            PFLog(@"disabled by flag; staying inert");
+            return;
+        }
 
-        // Prompt + floating button once there is a window to attach to.
-        pf_await_window(0);
+        // Nothing dangerous happens here. Arm happens after launch (or early on request).
+        if (pf_early_enabled()) {
+            PFLog(@"PF_EARLY set: arming at load time (risky)");
+            dispatch_async(dispatch_get_main_queue(), ^{ pf_arm("early"); });
+        }
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            PFLog(@"=== rescan (late-loaded classes) ===");
-            pf_scan();
-        });
-
+        pf_await_window(0);      // arms after launch, then shows UI
         pf_watch_keywords();
         pf_watch_ui();
     }
 }
+
