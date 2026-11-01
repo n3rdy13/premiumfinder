@@ -1,1 +1,47 @@
+name: Build PremiumFinder
 
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Compile dylib
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=13.0 \
+            -fobjc-arc -fblocks -O2 -Wall \
+            -framework Foundation -framework StoreKit -framework UIKit \
+            -Wl,-undefined,dynamic_lookup \
+            -Wl,-install_name,@executable_path/Frameworks/PremiumFinder.dylib \
+            -dynamiclib \
+            -o PremiumFinder.dylib \
+            PremiumFinder.m
+
+      - name: Verify
+        run: |
+          file PremiumFinder.dylib
+          ls -lh PremiumFinder.dylib
+          otool -L PremiumFinder.dylib || true
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: PremiumFinder-dylib
+          path: PremiumFinder.dylib
+          if-no-files-found: error
